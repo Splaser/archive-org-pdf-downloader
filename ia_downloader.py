@@ -4,8 +4,10 @@ import os
 import sys
 import json
 import hashlib
+import re
 import shutil
 import subprocess
+import time
 import requests
 from urllib.parse import quote, unquote
 
@@ -19,6 +21,7 @@ BAD_SUFFIX = (
 )
 
 STATE_FILE = ".ia_downloader_state.json"
+ISSUE_PATTERN = re.compile(r"(?<!\d)(\d{3})(?!\d)")
 
 
 def get_identifier(url):
@@ -32,14 +35,77 @@ def get_identifier(url):
     return parts[idx + 1]
 
 
+def request_json(url, params=None):
+    """Fetch JSON with bounded retries for transient Archive.org failures."""
+    last_error = None
+
+    for attempt in range(3):
+        try:
+            response = requests.get(url, params=params, timeout=30)
+            response.raise_for_status()
+            return response.json()
+        except (requests.RequestException, ValueError) as error:
+            last_error = error
+            if attempt < 2:
+                time.sleep(2 ** attempt)
+
+    raise RuntimeError(f"Archive.org request failed after 3 attempts: {last_error}")
+
+
+def find_alternative_identifiers(identifier):
+    data = request_json(
+        "https://archive.org/advancedsearch.php",
+        params={
+            "q": f"identifier:{identifier}*",
+            "fl[]": ["identifier", "title"],
+            "rows": 20,
+            "output": "json",
+        },
+    )
+    docs = data.get("response", {}).get("docs", [])
+    prefix = identifier.lower()
+
+    return sorted({
+        doc["identifier"]
+        for doc in docs
+        if doc.get("identifier", "").lower().startswith(prefix)
+        and doc["identifier"].lower() != prefix
+    })
+
+
 def get_files(identifier):
 
     api = f"https://archive.org/metadata/{identifier}"
+    data = request_json(api)
 
-    r = requests.get(api)
-    r.raise_for_status()
+    if not data.get("files"):
+        alternatives = find_alternative_identifiers(identifier)
 
-    data = r.json()
+        if len(alternatives) == 1:
+            resolved_identifier = alternatives[0]
+            print(
+                f"'{identifier}' has no public files; "
+                f"using '{resolved_identifier}' instead."
+            )
+            identifier = resolved_identifier
+            data = request_json(
+                f"https://archive.org/metadata/{identifier}"
+            )
+        else:
+            state = "dark/unavailable" if data.get("is_dark") else "empty/unavailable"
+            suggestion = (
+                f" Similar identifiers: {', '.join(alternatives)}"
+                if alternatives else ""
+            )
+            raise RuntimeError(
+                f"Archive.org item '{identifier}' is {state} and has no public files."
+                f"{suggestion}"
+            )
+
+    if not data.get("files"):
+        raise RuntimeError(
+            f"Archive.org item '{identifier}' returned no downloadable files."
+        )
 
     pdf = []
     epub = []
@@ -62,7 +128,9 @@ def get_files(identifier):
 
             epub.append(file_info(f))
 
-    return pdf, epub
+    pdf = keep_largest_pdf_per_issue(pdf)
+
+    return pdf, epub, identifier
 
 
 def file_info(metadata):
@@ -79,6 +147,79 @@ def file_info(metadata):
         "size": size,
         "md5": metadata.get("md5"),
     }
+
+
+def get_issue_id(filename):
+    """Return an independent 3-digit issue number, such as 002 or VOL.109."""
+    match = ISSUE_PATTERN.search(filename)
+    return match.group(1) if match else None
+
+
+def keep_largest_pdf_per_issue(files):
+    """For metadata variants of one issue, keep only the largest PDF."""
+    best_by_issue = {}
+
+    for item in files:
+        issue_id = get_issue_id(item["name"])
+        if issue_id is None:
+            continue
+
+        current = best_by_issue.get(issue_id)
+        item_size = item.get("size") if item.get("size") is not None else -1
+        current_size = (
+            current.get("size")
+            if current and current.get("size") is not None
+            else -1
+        )
+
+        if current is None or item_size > current_size:
+            best_by_issue[issue_id] = item
+
+    selected = [
+        item for item in files
+        if get_issue_id(item["name"]) is None
+        or best_by_issue[get_issue_id(item["name"])] is item
+    ]
+    removed_count = len(files) - len(selected)
+
+    if removed_count:
+        print(f"Smaller PDF variants skipped: {removed_count}")
+
+    return selected
+
+
+def remove_duplicate_pdfs(outdir):
+    """Delete smaller already-downloaded PDFs sharing the same issue number."""
+    groups = {}
+
+    for entry in os.scandir(outdir):
+        if not entry.is_file() or not entry.name.lower().endswith(".pdf"):
+            continue
+
+        issue_id = get_issue_id(entry.name)
+        if issue_id is not None:
+            groups.setdefault(issue_id, []).append(entry.path)
+
+    removed = []
+    for issue_id, paths in groups.items():
+        if len(paths) < 2:
+            continue
+
+        keep = max(paths, key=lambda path: (os.path.getsize(path), path))
+        print(f"Issue {issue_id}, keeping largest: {os.path.basename(keep)}")
+
+        for path in paths:
+            if path == keep:
+                continue
+
+            os.remove(path)
+            control_file = path + ".aria2"
+            if os.path.exists(control_file):
+                os.remove(control_file)
+            removed.append(os.path.basename(path))
+            print(f"Removed smaller duplicate: {os.path.basename(path)}")
+
+    return removed
 
 
 def build_download_url(identifier, filename):
@@ -355,6 +496,8 @@ if __name__ == "__main__":
         exist_ok=True
     )
 
+    remove_duplicate_pdfs(outdir)
+
 
     identifier = get_identifier(
         archive_url
@@ -367,7 +510,7 @@ if __name__ == "__main__":
     )
 
 
-    pdf_files, epub_files = get_files(
+    pdf_files, epub_files, identifier = get_files(
         identifier
     )
 
