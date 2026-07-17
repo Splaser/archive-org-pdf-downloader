@@ -222,8 +222,11 @@ __marimo__/
 *.epub
 *.cbz
 *.pdf
+*.txt
 
 probe_output/
 tmp/
 downloads/
+aria2_pdf.txt
+*.aria2
 test/
